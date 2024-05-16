@@ -1,3 +1,4 @@
+from typing import List, Callable
 import os
 import requests
 import zipfile
@@ -5,6 +6,7 @@ import pickle
 import pandas as pd
 import numpy as np
 import jax.numpy as jnp
+import torch
 
 from torch.utils.data import Dataset
 from rdkit import Chem
@@ -212,9 +214,25 @@ class QM9Dataset(Dataset):
                 pass
         return item
 
+    def calc_stats(self):
+        ys = np.array([data["y"].item() for data in self])
+        mean = np.mean(ys)
+        mad = np.mean(np.abs(ys - mean))
+        return mean, mad
+
+    def top_n_nodes(self, n: int) -> List[int]:
+        """Returns the largest n nodes in the dataset."""
+        return [int(k) for k in torch.topk(torch.tensor([a["pos"].shape[0] for a in self.data]), n)[0]]
+
+    def top_n_edges(self, n: int) -> List[int]:
+        """Returns the largest n edge in the dataset."""
+        return [int(k) for k in torch.topk(torch.tensor([a["edge_index"].shape[1] for a in self.data]), n)[0]]
+
+
 def collate_fn(batch):
-    pos, x, y, batch_idx, edge_index_batch, edge_attr_batch = [], [], [], [], [], []
+    pos, x, y, batch_idx, edge_index_batch, edge_attr_batch, ptr = [], [], [], [], [], [], []
     cum_nodes = 0
+    ptr.append(0)
     for i, item in enumerate(batch):
         num_nodes = item['x'].shape[0]
         pos.append(item['pos'])
@@ -225,13 +243,63 @@ def collate_fn(batch):
         edge_index_batch.append(edge_index)
         edge_attr_batch.append(item['edge_attr'])
         cum_nodes += num_nodes
+        ptr.append(cum_nodes)
     pos = np.concatenate(pos, axis=0)
     x = np.concatenate(x, axis=0)
     y = np.stack(y, axis=0)
     batch_idx = np.array(batch_idx, dtype=jnp.int32)
+    ptr = np.array(ptr, dtype=jnp.int32)
     edge_index = np.concatenate(edge_index_batch, axis=1)
     edge_attr = np.concatenate(edge_attr_batch, axis=0)
-    return {'pos': pos, 'x': x, 'y': y, 'batch': batch_idx, 'edge_index': edge_index,'edge_attr': edge_attr}
+    return {'pos': pos, 'x': x, 'y': y, 'batch': batch_idx, 'ptr': ptr, 'edge_index': edge_index,'edge_attr': edge_attr}
+
+
+def QM9GraphTransform(
+    max_batch_nodes: int,
+    max_batch_edges: int,
+) -> Callable:
+    def _qm9_transform(data):
+        pos = jnp.array(data["pos"])
+        x = jnp.array(data["x"])
+        edge_attr = jnp.array(data["edge_attr"])
+        edge_index = jnp.array(data["edge_index"], dtype=jnp.int32)
+        graph_index = jnp.array(data["batch"], dtype=jnp.int32)
+        # ptr = jnp.array(data["ptr"])
+        # n_node = jnp.diff(ptr)
+        # n_edge = jnp.diff(jnp.sum(edge_index[0][:, None] < ptr, axis=0))
+        n_nodes = x.shape[0]
+        n_edges = edge_index.shape[1]
+        
+        # pad for jax static shapes (0.8 as (un)safety factor)
+        n_node_pad = int(0.8 * max_batch_nodes - n_nodes + 1)
+        n_edge_pad = int(0.8 * max_batch_edges - n_edges + 1)
+        node_pad = ((0, n_node_pad), (0, 0))
+        edge_pad = ((0, n_edge_pad), (0, 0))
+        edge_index_pad = ((0, 0), (0, n_edge_pad))
+        pos = jnp.pad(pos, node_pad)
+        x = jnp.pad(x, node_pad)
+        edge_index = jnp.pad(edge_index, edge_index_pad, constant_values=edge_index.max() + 1)
+        edge_attr = jnp.pad(edge_attr, edge_pad)
+        # most important part: batch indices
+        graph_index = jnp.append(graph_index,  jnp.array(n_node_pad * [graph_index[-1] + 1]))
+        padding_mask = jnp.append(jnp.ones_like(data["y"]), 0)
+        
+        # also pad targets (graph task)
+        target = jnp.append(jnp.array(data["y"]), 0)
+
+        graph = {
+            "pos": pos,
+            "x": x,
+            "edge_index": edge_index,
+            "edge_attr": edge_attr,
+            "graph_index": graph_index,
+            "y": target,
+            "padding_mask": padding_mask
+        }
+        return graph
+
+    return _qm9_transform
+
 
 if __name__ == '__main__':
     from torch.utils.data import DataLoader

@@ -1,3 +1,5 @@
+import os
+
 from typing import Any, Dict
 import jax
 import jax.numpy as jnp
@@ -11,7 +13,7 @@ import wandb
 from tqdm import tqdm
 from functools import partial
 
-from datasets.qm9 import QM9Dataset, collate_fn
+from datasets.qm9 import QM9Dataset, collate_fn, QM9GraphTransform
 from models.ponita_scatter import Ponita
 
 from torch.utils.data import DataLoader
@@ -23,7 +25,7 @@ from flax import struct, core
 
 from orbax import checkpoint
 
-jax.config.update("jax_disable_jit", True)
+# jax.config.update("jax_disable_jit", True)
 
 
 
@@ -71,14 +73,6 @@ class RandomSOd:
         if n:
             return rotation_matrix.reshape(n, 3, 3)
         return rotation_matrix.reshape(3, 3)
-
-
-
-
-
-
-
-
 
 
 class  BaseJaxTrainer:
@@ -190,20 +184,10 @@ class  BaseJaxTrainer:
         )
 
 
-
-
-
-
-
-
 class TrainState(struct.PyTreeNode):
     params: core.FrozenDict[str, Any] = struct.field(pytree_node=True)
     rng: jnp.ndarray = struct.field(pytree_node=True)
     opt_state: core.FrozenDict[str, Any] = struct.field(pytree_node=True)
-
-
-
-
 
 
 class QM9Trainer(BaseJaxTrainer):
@@ -230,21 +214,29 @@ class QM9Trainer(BaseJaxTrainer):
         # Transform
         self.train_aug = config.training.train_augmentation
         self.rotation_generator = RandomSOd(3)
+        
+        max_batch_nodes = int(sum(train_loader.dataset.top_n_nodes(config.training.batch_size)))
+        max_batch_edges = int(sum(train_loader.dataset.top_n_edges(config.training.batch_size)))
+        
+        self.batch_transform = QM9GraphTransform(
+            max_batch_nodes=max_batch_nodes,
+            max_batch_edges=max_batch_edges,
+        )
 
         # Model
         self.model = Ponita(
-                input_dim = self.in_channels_scalar + in_channels_vec,
-                hidden_dim = config.ponita.hidden_dim,
-                output_dim = out_channels_scalar,
-                batch_size = config.training.batch_size,
-                num_layers = config.ponita.num_layers,
-                output_dim_vec = out_channels_vec,
-                num_ori = config.ponita.num_ori,
-                basis_dim = config.ponita.basis_dim,
-                degree = config.ponita.degree,
-                widening_factor = config.ponita.widening_factor,
-                global_pool = True,
-                multiple_readouts = False,
+            input_dim = self.in_channels_scalar + in_channels_vec,
+            hidden_dim = config.ponita.hidden_dim,
+            output_dim = out_channels_scalar,
+            batch_size = config.training.batch_size,
+            num_layers = config.ponita.num_layers,
+            output_dim_vec = out_channels_vec,
+            num_ori = config.ponita.num_ori,
+            basis_dim = config.ponita.basis_dim,
+            degree = config.ponita.degree,
+            widening_factor = config.ponita.widening_factor,
+            global_pool = True,
+            multiple_readouts = False,
         )
 
         self.shift = 0
@@ -277,13 +269,15 @@ class QM9Trainer(BaseJaxTrainer):
 
         # Split key
         key, model_key = jax.random.split(key)
-
+        
         # Initialize model
-        pos = jnp.ones((29,3))
-        x = jnp.ones((29,5))
-        batch = jnp.zeros((29,), dtype=jnp.int32)
-        edge_index = jnp.ones((2, 100), dtype=jnp.int32)
-        model_params = self.model.init(model_key, pos, x, edge_index, batch)
+        batch = self.batch_transform(next(iter(self.train_loader)))
+
+        # pos = jnp.ones((29,3))
+        # x = jnp.ones((29,5))
+        # batch = jnp.zeros((29,), dtype=jnp.int32)
+        # edge_index = jnp.ones((2, 100), dtype=jnp.int32)
+        model_params = self.model.init(model_key, batch["pos"], batch["x"], batch["edge_index"], batch["graph_index"])
 
         # Create train state
         train_state = TrainState(
@@ -314,14 +308,18 @@ class QM9Trainer(BaseJaxTrainer):
             # Apply 3 D rotation augmentation
             if self.train_aug and train:
                 rot = self.rotation_generator()
-                batch['pos'] = jnp.einsum('ij, bj->bi', rot, batch['pos'])
+                batch["pos"] = jnp.einsum('ij, bj->bi', rot, batch["pos"])
             
             # Define loss and calculate gradients
             def loss_fn(params):
-                pred, _ = self.model.apply(params, batch['pos'], batch['x'], batch['edge_index'], batch['batch'])
-                label = batch['y']
+                pred, _ = self.model.apply(params, batch["pos"], batch["x"], batch["edge_index"], batch["graph_index"])
+                label = batch["y"]
+                # mask out padded graph
+                padding_mask = batch["padding_mask"]
+                pred = pred * padding_mask
+                label = label * padding_mask
                 loss = jnp.abs(pred - ((label - self.shift) / self.scale))
-                return jnp.mean(loss)
+                return jnp.sum(loss) / jnp.count_nonzero(padding_mask)
             loss, grads = jax.value_and_grad(loss_fn)(state.params)
 
             # Update autodecoder
@@ -373,7 +371,9 @@ class QM9Trainer(BaseJaxTrainer):
         # Loop over batches
         losses = 0
         for batch_idx, batch in enumerate(self.train_loader):
- 
+            # pad graphs
+            batch = self.batch_transform(batch)
+            
             loss, state = self.train_step(state, batch)
             losses += loss
 
@@ -400,6 +400,9 @@ class QM9Trainer(BaseJaxTrainer):
         # Loop over batches
         losses = 0
         for batch_idx, batch in enumerate(self.val_loader):
+            # pad graphs
+            batch = self.batch_transform(batch)
+            
             loss, _ = self.val_step(state, batch)
             losses += loss
 
@@ -414,9 +417,6 @@ class QM9Trainer(BaseJaxTrainer):
         # Update epoch loss
         self.val_mse_epoch = losses / len(self.val_loader)
         wandb.log({'val_mse_epoch': self.val_mse_epoch}, commit=False)
-
-
-
 
 
 @hydra.main(version_base=None, config_path="./configs", config_name="qm9_regression")
